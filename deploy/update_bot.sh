@@ -6,15 +6,16 @@
 echo "Обновление бота Влада..."
 
 # Переход в директорию проекта
-cd /home/botuser/vlad_bot
+cd /home/username/bots/vlad_bot
 
 # Получение последних изменений из репозитория
 echo "Получение последних изменений из репозитория..."
-sudo -u botuser git pull
+git pull
 
 # Обновление зависимостей
 echo "Обновление зависимостей..."
-sudo -u botuser venv/bin/pip install -r requirements.txt
+source venv/bin/activate
+pip install -r requirements.txt
 
 # Перезапуск сервиса
 echo "Перезапуск сервиса бота..."
