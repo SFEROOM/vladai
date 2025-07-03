@@ -1,0 +1,8 @@
+# Core dependencies
+aiogram==2.25.1
+sqlalchemy==2.0.41
+apscheduler==3.11.0
+openai==0.28.0
+
+# Security and environment
+python-dotenv==1.0.0 
