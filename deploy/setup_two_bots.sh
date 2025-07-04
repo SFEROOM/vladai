@@ -112,7 +112,7 @@ TELEGRAM_BOT_TOKEN = "7121245928:AAGveKEg8USR1GiWt-UXnv_ltb4UVfCJFEQ"
 OPENAI_API_KEY = "sk-proj-nJsAOvb9QJxcxB8DJKqLT3BlbkFJcRu8LGIlTvT5aqGHPGqO"
 
 # Database Configuration - уникальная база для каждого ребенка
-DATABASE_URL = f'sqlite:///sanek_assistant.db'
+DATABASE_URL = f'sqlite:///санек_assistant.db'
 
 # Logging Configuration
 LOG_LEVEL = 'INFO'
@@ -132,7 +132,7 @@ EOF
 
 # Удаление существующей базы данных для Санька
 echo "Удаление существующей базы данных для Санька..."
-rm -f /home/bots/sanek/family_assistant.db /home/bots/sanek/sanek_assistant.db
+rm -f /home/bots/sanek/family_assistant.db /home/bots/sanek/sanek_assistant.db /home/bots/sanek/санек_assistant.db
 
 # Создание виртуального окружения для Санька
 echo "Настройка виртуального окружения для бота Санька..."
