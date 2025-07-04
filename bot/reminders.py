@@ -318,6 +318,9 @@ async def complete_reminder(callback_query: types.CallbackQuery):
                 
                 # Создаем дату следующего месяца
                 next_time = reminder.reminder_time.replace(year=next_year, month=next_month)
+            elif reminder.repeat_type == 'hourly':
+                # Для почасовых напоминаний
+                next_time = reminder.reminder_time + timedelta(hours=reminder.repeat_interval)
             
             if next_time:
                 # Создаем новое напоминание
@@ -377,6 +380,9 @@ async def skip_reminder(callback_query: types.CallbackQuery):
                 next_month = ((next_month - 1) % 12) + 1
                 
                 next_time = reminder.reminder_time.replace(year=next_year, month=next_month)
+            elif reminder.repeat_type == 'hourly':
+                # Для почасовых напоминаний
+                next_time = reminder.reminder_time + timedelta(hours=reminder.repeat_interval)
             
             if next_time:
                 new_reminder = Reminder(
@@ -406,7 +412,7 @@ async def skip_reminder(callback_query: types.CallbackQuery):
         db.close()
 
 # Обработчик для удаления напоминания
-@dp.callback_query_handler(lambda c: c.data.startswith('reminder_delete_'))
+@dp.callback_query_handler(lambda c: c.data.startswith('reminder_delete_') and not c.data.startswith('reminder_delete_confirm_'))
 async def delete_reminder(callback_query: types.CallbackQuery):
     """Удаление напоминания"""
     reminder_id = int(callback_query.data.split('_')[2])

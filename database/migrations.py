@@ -168,6 +168,27 @@ def run_migrations():
             """)
             migrations_applied = True
         
+        # Проверяем наличие таблицы users
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+        users_table_exists = cursor.fetchone()
+        
+        # Миграция 11: Создание таблицы users, если её нет
+        if not users_table_exists:
+            logger.info("Применение миграции: создание таблицы users")
+            cursor.execute("""
+                CREATE TABLE users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER UNIQUE NOT NULL,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_active INTEGER DEFAULT 1
+                )
+            """)
+            migrations_applied = True
+        
         # Сохраняем изменения
         conn.commit()
         

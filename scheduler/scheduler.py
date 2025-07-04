@@ -31,11 +31,30 @@ async def check_reminders():
         now = datetime.now()
         
         # Находим все активные напоминания, время которых наступило
+        # но не старше 1 минуты (чтобы не отправлять старые напоминания)
+        one_minute_ago = now - timedelta(minutes=1)
         reminders = db.query(Reminder).filter(
             Reminder.status == 'active',
-            Reminder.reminder_time <= now
+            Reminder.reminder_time <= now,
+            Reminder.reminder_time > one_minute_ago
         ).all()
         
+        if not reminders:
+            return
+            
+        logger.info(f"Найдено {len(reminders)} напоминаний для отправки")
+        
+        # Получаем всех активных пользователей из базы данных
+        from database.models import User
+        users = db.query(User).filter(User.is_active == 1).all()
+        
+        if not users:
+            logger.warning("Не удалось найти пользователей для отправки напоминаний")
+            return
+            
+        logger.info(f"Найдено {len(users)} активных пользователей для отправки напоминаний")
+        
+        # Обрабатываем каждое напоминание
         for reminder in reminders:
             try:
                 # Получаем информацию о ребенке
@@ -45,7 +64,7 @@ async def check_reminders():
                     continue
                 
                 # Формируем сообщение
-                message = f"⏰ *Напоминание*\n\n{reminder.description}"
+                message = f"⏰ *Напоминание для {child.name}*\n\n{reminder.description}"
                 
                 # Создаем клавиатуру с кнопками
                 keyboard = InlineKeyboardMarkup()
@@ -54,17 +73,20 @@ async def check_reminders():
                     InlineKeyboardButton("⏭️ Пропустить", callback_data=f"reminder_skip_{reminder.id}")
                 )
                 
-                # Отправляем напоминание
-                await bot.send_message(
-                    chat_id=int(os.environ.get('ADMIN_CHAT_ID', '0')),  # Здесь нужно указать ID чата администратора
-                    text=message,
-                    reply_markup=keyboard,
-                    parse_mode='Markdown'
-                )
+                # Отправляем напоминание всем активным пользователям
+                for user in users:
+                    try:
+                        await bot.send_message(
+                            chat_id=user.telegram_id,
+                            text=message,
+                            reply_markup=keyboard,
+                            parse_mode='Markdown'
+                        )
+                        logger.info(f"Отправлено напоминание пользователю {user.telegram_id} ({user.username}): {reminder.description}")
+                    except Exception as send_error:
+                        logger.error(f"Ошибка при отправке напоминания пользователю {user.telegram_id}: {send_error}")
                 
-                logger.info(f"Отправлено напоминание: {reminder.description}")
-                
-                # Если это однократное напоминание, помечаем его как выполненное
+                # Если это однократное напоминание, помечаем его как отправленное
                 if reminder.repeat_type == 'once':
                     reminder.status = 'sent'
                     db.commit()
@@ -85,6 +107,9 @@ async def check_reminders():
                         
                         # Создаем дату следующего месяца
                         next_time = reminder.reminder_time.replace(year=next_year, month=next_month)
+                    elif reminder.repeat_type == 'hourly':
+                        # Для почасовых напоминаний
+                        next_time = reminder.reminder_time + timedelta(hours=reminder.repeat_interval)
                     
                     if next_time:
                         # Создаем новое напоминание
@@ -130,16 +155,25 @@ async def check_feeding_intervals():
                 # Получаем информацию о ребенке
                 child = db.query(Child).get(last_feeding.child_id)
                 
-                # Отправляем напоминание о кормлении
-                await bot.send_message(
-                    chat_id=int(os.environ.get('ADMIN_CHAT_ID', '0')),
-                    text=f"⚠️ *Напоминание о кормлении*\n\n"
-                         f"Прошло более 3 часов с последнего кормления {child.name if child else ''}.\n"
-                         f"Последнее кормление было в {last_feeding.timestamp.strftime('%H:%M')}.",
-                    parse_mode='Markdown'
-                )
+                # Получаем ID пользователя для отправки уведомления
+                from aiogram.types import User
+                users = await bot.get_updates(limit=1, offset=-1)
                 
-                logger.info(f"Отправлено напоминание о кормлении")
+                if users and users[0].message and users[0].message.from_user:
+                    user_id = users[0].message.from_user.id
+                    
+                    # Отправляем напоминание о кормлении
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=f"⚠️ *Напоминание о кормлении*\n\n"
+                             f"Прошло более 3 часов с последнего кормления {child.name if child else ''}.\n"
+                             f"Последнее кормление было в {last_feeding.timestamp.strftime('%H:%M')}.",
+                        parse_mode='Markdown'
+                    )
+                    
+                    logger.info(f"Отправлено напоминание о кормлении")
+                else:
+                    logger.warning("Не удалось определить пользователя для отправки напоминания о кормлении")
         
     except Exception as e:
         logger.error(f"Ошибка при проверке интервалов кормления: {e}")
@@ -201,14 +235,23 @@ async def generate_daily_report():
         else:
             report += "Нет данных\n\n"
         
-        # Отправляем отчет
-        await bot.send_message(
-            chat_id=int(os.environ.get('ADMIN_CHAT_ID', '0')),
-            text=report,
-            parse_mode='Markdown'
-        )
+        # Получаем ID пользователя для отправки отчета
+        from aiogram.types import User
+        users = await bot.get_updates(limit=1, offset=-1)
         
-        logger.info(f"Отправлен ежедневный отчет")
+        if users and users[0].message and users[0].message.from_user:
+            user_id = users[0].message.from_user.id
+            
+            # Отправляем отчет
+            await bot.send_message(
+                chat_id=user_id,
+                text=report,
+                parse_mode='Markdown'
+            )
+            
+            logger.info(f"Отправлен ежедневный отчет")
+        else:
+            logger.warning("Не удалось определить пользователя для отправки ежедневного отчета")
         
     except Exception as e:
         logger.error(f"Ошибка при генерации ежедневного отчета: {e}")

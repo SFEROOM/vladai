@@ -13,7 +13,7 @@ import json
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database.database import get_db, SessionLocal
-from database.models import Child, Reminder, Appointment, Feeding, Stool, Weight, Medication, Prescription, Note
+from database.models import Child, Reminder, Appointment, Feeding, Stool, Weight, Medication, Prescription, Note, ChatHistory, User
 from config import TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, LOG_LEVEL, GOOGLE_SHEETS_ENABLED, GOOGLE_SHEETS_SPREADSHEET_ID
 import re
 from datetime import datetime, timedelta
@@ -87,39 +87,60 @@ class NotesState(StatesGroup):
     waiting_for_content = State()
     waiting_for_edit_content = State()
 
+async def save_user(user_data: types.User, db: Session):
+    """Сохраняет или обновляет информацию о пользователе в базе данных"""
+    try:
+        # Проверяем, существует ли пользователь
+        user = db.query(User).filter_by(telegram_id=user_data.id).first()
+        
+        if not user:
+            # Создаем нового пользователя
+            user = User(
+                telegram_id=user_data.id,
+                username=user_data.username,
+                first_name=user_data.first_name,
+                last_name=user_data.last_name,
+                is_active=1
+            )
+            db.add(user)
+            logger.info(f"Добавлен новый пользователь: {user_data.id} ({user_data.username})")
+        else:
+            # Обновляем информацию о пользователе
+            user.username = user_data.username
+            user.first_name = user_data.first_name
+            user.last_name = user_data.last_name
+            user.updated_at = datetime.now()
+            user.is_active = 1
+            
+        db.commit()
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении пользователя: {e}")
+        db.rollback()
+
 @dp.message_handler(commands=['start'])
 async def start_cmd(message: types.Message):
-    """Приветственное сообщение и проверка регистрации ребенка"""
-    with SessionLocal() as db:
+    """Обработка команды /start"""
+    db: Session = next(get_db())
+    try:
+        # Сохраняем информацию о пользователе
+        await save_user(message.from_user, db)
+        
+        # Проверяем, есть ли зарегистрированный ребенок
         child = db.query(Child).first()
-        if not child:
-            await message.answer(
-                "🏥 Добро пожаловать в семейный медицинский ассистент!\n\n"
-                "Для начала работы нужно зарегистрировать ребенка.\n"
-                "Введите имя ребенка:"
+        if child:
+            await show_main_menu(message)
+        else:
+            await message.reply(
+                f"👋 Привет, {message.from_user.first_name}!\n\n"
+                "Я - ваш семейный медицинский ассистент. "
+                "Я помогу вам отслеживать здоровье вашего ребенка.\n\n"
+                "Для начала давайте зарегистрируем ребенка.\n"
+                "Введите имя ребенка:",
+                reply_markup=types.ReplyKeyboardRemove()
             )
             await ChildRegistrationState.waiting_for_name.set()
-        else:
-            await message.answer(
-                f"🏥 *Добро пожаловать в семейный медицинский ассистент!*\n\n"
-                f"Я помогаю вести учет всех важных показателей здоровья и развития {child.name}.\n\n"
-                f"*Мои возможности:*\n"
-                f"• Отслеживание кормлений и питания\n"
-                f"• Контроль веса и динамики роста\n"
-                f"• Мониторинг стула и пищеварения\n"
-                f"• Учет приема лекарств и витаминов\n"
-                f"• Управление медицинскими назначениями\n"
-                f"• Система напоминаний с гибкими настройками\n"
-                f"• Анализ развития на основе собранных данных\n"
-                f"• Ведение заметок о ребенке\n\n"
-                f"Вся информация надежно сохраняется в базе данных и доступна для анализа в любой момент.\n"
-                f"Используйте команду /help для получения справки по всем функциям.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            await message.answer(
-                f"Выберите действие из меню ниже:",
-                reply_markup=get_main_keyboard()
-            )
+    finally:
+        db.close()
 
 @dp.message_handler(commands=['help'])
 async def send_help(message: types.Message):
@@ -245,13 +266,13 @@ async def show_reminders_list(callback_query: types.CallbackQuery):
         reminders = db.query(Reminder).filter(
             Reminder.child_id == child.id,
             Reminder.status == 'active'
-        ).order_by(Reminder.time).all()
+        ).order_by(Reminder.reminder_time).all()
         
         if not reminders:
             # Создаем клавиатуру с кнопками
             keyboard = InlineKeyboardMarkup(row_width=1)
             keyboard.add(
-                InlineKeyboardButton("➕ Добавить напоминание", callback_data="add_reminder"),
+                InlineKeyboardButton("➕ Добавить напоминание", callback_data="reminder_create"),
                 InlineKeyboardButton("🔙 Назад в меню", callback_data="back_to_menu")
             )
             
@@ -262,37 +283,54 @@ async def show_reminders_list(callback_query: types.CallbackQuery):
             )
             return
         
-        # Создаем клавиатуру с кнопками для каждого напоминания
-        keyboard = InlineKeyboardMarkup(row_width=1)
+        # Создаем клавиатуру с кнопками для каждого напоминания и кнопками действий
+        keyboard = InlineKeyboardMarkup(row_width=2)
         
         for reminder in reminders:
             # Форматируем время
-            time_str = reminder.time.strftime("%H:%M")
+            time_str = reminder.reminder_time.strftime("%H:%M")
             
             # Форматируем дату
-            if reminder.date:
-                date_str = reminder.date.strftime("%d.%m.%Y")
+            if reminder.repeat_type == 'once':
+                date_str = reminder.reminder_time.strftime("%d.%m.%Y")
                 button_text = f"⏰ {time_str} {date_str} - {reminder.description}"
             else:
-                button_text = f"⏰ {time_str} (ежедневно) - {reminder.description}"
+                if reminder.repeat_type == 'daily':
+                    repeat_text = "ежедневно"
+                elif reminder.repeat_type == 'weekly':
+                    repeat_text = "еженедельно"
+                elif reminder.repeat_type == 'monthly':
+                    repeat_text = "ежемесячно"
+                elif reminder.repeat_type == 'hourly':
+                    repeat_text = f"каждые {reminder.repeat_interval} час(ов)"
+                else:
+                    repeat_text = "повтор"
+                button_text = f"⏰ {time_str} ({repeat_text}) - {reminder.description}"
             
+            # Добавляем кнопку с напоминанием
             keyboard.add(
                 InlineKeyboardButton(
                     text=button_text,
                     callback_data=f"reminder_view_{reminder.id}"
                 )
             )
+            
+            # Добавляем кнопки действий для этого напоминания
+            keyboard.row(
+                InlineKeyboardButton("✅ Выполнено", callback_data=f"reminder_complete_{reminder.id}"),
+                InlineKeyboardButton("⏭️ Пропустить", callback_data=f"reminder_skip_{reminder.id}")
+            )
         
         # Добавляем кнопки навигации
         keyboard.add(
-            InlineKeyboardButton("➕ Добавить напоминание", callback_data="add_reminder"),
+            InlineKeyboardButton("➕ Добавить напоминание", callback_data="reminder_create"),
             InlineKeyboardButton("🔙 Назад в меню", callback_data="back_to_menu")
         )
         
         await bot.send_message(
             callback_query.from_user.id,
             "📋 *Список активных напоминаний*\n\n"
-            "Выберите напоминание для просмотра или управления:",
+            "Выберите напоминание для просмотра или отметьте его выполнение/пропуск:",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=keyboard
         )
@@ -326,13 +364,13 @@ async def view_reminder(callback_query: types.CallbackQuery):
             return
         
         # Форматируем информацию о напоминании
-        time_str = reminder.time.strftime("%H:%M")
+        time_str = reminder.reminder_time.strftime("%H:%M")
         
         # Форматируем дату
-        if reminder.date:
-            date_str = reminder.date.strftime("%d.%m.%Y")
+        if reminder.repeat_type == 'once':
+            date_str = reminder.reminder_time.strftime("%d.%m.%Y")
         else:
-            date_str = "Ежедневно"
+            date_str = "Повторяющееся"
         
         # Форматируем повторение
         if reminder.repeat_type == 'once':
@@ -343,6 +381,8 @@ async def view_reminder(callback_query: types.CallbackQuery):
             repeat_str = "Еженедельно"
         elif reminder.repeat_type == 'monthly':
             repeat_str = "Ежемесячно"
+        elif reminder.repeat_type == 'hourly':
+            repeat_str = f"Каждые {reminder.repeat_interval} час(ов)"
         elif reminder.repeat_type == 'custom':
             repeat_str = f"Каждые {reminder.repeat_interval} дней"
         else:
@@ -416,7 +456,6 @@ async def show_main_menu(message: types.Message):
         InlineKeyboardButton("🍼 Кормление", callback_data='feeding'),
         InlineKeyboardButton("⚖️ Вес", callback_data='weight'),
         InlineKeyboardButton("💩 Стул", callback_data='stool'),
-        InlineKeyboardButton("💊 Лекарства", callback_data='medication'),
         InlineKeyboardButton("📝 Назначения", callback_data='prescriptions'),
         InlineKeyboardButton("⏰ Напоминания", callback_data='reminders_menu'),
         InlineKeyboardButton("📊 Статистика", callback_data='stats'),
@@ -429,7 +468,7 @@ async def show_main_menu(message: types.Message):
                        parse_mode=ParseMode.MARKDOWN)
 
 # Function to handle callback queries for main menu
-@dp.callback_query_handler(lambda c: c.data in ['feeding', 'stool', 'weight', 'medication', 'reminders_menu', 'stats', 'prescriptions', 'spreadsheet', 'settings', 'notes'])
+@dp.callback_query_handler(lambda c: c.data in ['feeding', 'stool', 'weight', 'reminders_menu', 'stats', 'prescriptions', 'spreadsheet', 'settings', 'notes'])
 async def process_main_menu(callback_query: types.CallbackQuery):
     """Обработка выбора из главного меню"""
     action = callback_query.data
@@ -526,35 +565,201 @@ async def process_main_menu(callback_query: types.CallbackQuery):
         return
         
     if action == 'feeding':
-        # Fetch the last feeding record
-        last_feeding = db.query(Feeding).order_by(Feeding.timestamp.desc()).first()
-        if last_feeding:
-            # Форматируем дату и время
-            date_str = last_feeding.timestamp.strftime("%d.%m.%Y, %H:%M")
-            last_feeding_info = f"Последнее кормление: {last_feeding.amount} мл {last_feeding.food_type.lower()} ({date_str})"
+        await bot.answer_callback_query(callback_query.id)
+        
+        # Получаем последние 7 кормлений
+        last_feedings = db.query(Feeding).filter_by(child_id=child.id).order_by(Feeding.timestamp.desc()).limit(7).all()
+        
+        if last_feedings:
+            # Формируем список кормлений
+            feedings_text = "🍼 *Последние 7 кормлений:*\n\n"
+            for feeding in last_feedings:
+                date_str = feeding.timestamp.strftime("%d.%m.%Y, %H:%M")
+                food_type_emoji = "🤱" if feeding.food_type == "Грудное молоко" else "🍼" if feeding.food_type == "Смесь" else "🥄"
+                feedings_text += f"{food_type_emoji} {date_str} - {feeding.amount} мл ({feeding.food_type})\n"
+            
+            # Генерируем AI сводку
+            await bot.send_message(
+                callback_query.from_user.id,
+                feedings_text,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Отправляем сообщение о генерации сводки
+            await bot.send_message(
+                callback_query.from_user.id,
+                "🤖 Анализирую данные о кормлениях..."
+            )
+            
+            # Генерируем AI сводку по кормлениям
+            feeding_summary = ai_assistant.generate_feeding_summary(db)
+            
+            # Создаем клавиатуру
+            keyboard = InlineKeyboardMarkup(row_width=2)
+            keyboard.add(
+                InlineKeyboardButton("➕ Добавить кормление", callback_data='add_feeding'),
+                InlineKeyboardButton("📊 Статистика", callback_data='feeding_stats'),
+                InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu')
+            )
+            
+            await bot.send_message(
+                callback_query.from_user.id,
+                f"📊 *AI Анализ кормлений:*\n\n{feeding_summary}",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard
+            )
         else:
-            last_feeding_info = "Нет данных о предыдущих кормлениях."
-        await bot.send_message(callback_query.from_user.id, last_feeding_info)
-        await bot.send_message(callback_query.from_user.id, "Введите количество молока в граммах:")
-        await FeedingState.waiting_for_amount.set()
+            # Если нет данных о кормлениях
+            keyboard = InlineKeyboardMarkup(row_width=1)
+            keyboard.add(
+                InlineKeyboardButton("➕ Добавить первое кормление", callback_data='add_feeding'),
+                InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu')
+            )
+            
+            await bot.send_message(
+                callback_query.from_user.id,
+                "У вас пока нет записей о кормлениях.",
+                reply_markup=keyboard
+            )
+        
+        db.close()
+        return
 
     elif action == 'stool':
-        await bot.send_message(callback_query.from_user.id, "💩 Опишите стул ребенка (цвет, консистенция):")
-        await StoolState.waiting_for_description.set()
+        await bot.answer_callback_query(callback_query.id)
         
+        # Получаем последние 7 записей о стуле
+        last_stools = db.query(Stool).filter_by(child_id=child.id).order_by(Stool.timestamp.desc()).limit(7).all()
+        
+        if last_stools:
+            # Формируем список записей о стуле
+            stools_text = "💩 *Последние 7 записей о стуле:*\n\n"
+            for stool in last_stools:
+                date_str = stool.timestamp.strftime("%d.%m.%Y, %H:%M")
+                color_text = f" ({stool.color})" if stool.color else ""
+                stools_text += f"📝 {date_str} - {stool.description}{color_text}\n"
+            
+            await bot.send_message(
+                callback_query.from_user.id,
+                stools_text,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Генерируем AI сводку
+            await bot.send_message(
+                callback_query.from_user.id,
+                "🤖 Анализирую данные о пищеварении..."
+            )
+            
+            stool_summary = ai_assistant.generate_stool_summary(db)
+            
+            # Создаем клавиатуру
+            keyboard = InlineKeyboardMarkup(row_width=2)
+            keyboard.add(
+                InlineKeyboardButton("➕ Добавить запись", callback_data='add_stool'),
+                InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu')
+            )
+            
+            await bot.send_message(
+                callback_query.from_user.id,
+                f"📊 *AI Анализ пищеварения:*\n\n{stool_summary}",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard
+            )
+        else:
+            # Если нет данных о стуле
+            keyboard = InlineKeyboardMarkup(row_width=1)
+            keyboard.add(
+                InlineKeyboardButton("➕ Добавить первую запись", callback_data='add_stool'),
+                InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu')
+            )
+            
+            await bot.send_message(
+                callback_query.from_user.id,
+                "У вас пока нет записей о стуле ребенка.",
+                reply_markup=keyboard
+            )
+        
+        db.close()
+        return
+
     elif action == 'weight':
-        last_weight = db.query(Weight).filter_by(child_id=child.id).order_by(Weight.timestamp.desc()).first()
-        if last_weight:
-            # Форматируем дату и время
-            date_str = last_weight.timestamp.strftime("%d.%m.%Y, %H:%M")
-            await bot.send_message(callback_query.from_user.id, 
-                f"⚖️ Последний вес: {last_weight.weight} кг ({date_str})")
-        await bot.send_message(callback_query.from_user.id, "Введите текущий вес в килограммах:")
-        await WeightState.waiting_for_weight.set()
+        await bot.answer_callback_query(callback_query.id)
         
-    elif action == 'medication':
-        await bot.send_message(callback_query.from_user.id, "💊 Введите название лекарства:")
-        await MedicationState.waiting_for_name.set()
+        # Получаем последние 7 записей о весе
+        last_weights = db.query(Weight).filter_by(child_id=child.id).order_by(Weight.timestamp.desc()).limit(7).all()
+        
+        if last_weights:
+            # Формируем список измерений веса
+            weights_text = "⚖️ *Последние 7 измерений веса:*\n\n"
+            for weight in last_weights:
+                date_str = weight.timestamp.strftime("%d.%m.%Y, %H:%M")
+                weights_text += f"📊 {date_str} - {weight.weight} кг\n"
+            
+            # Вычисляем прирост за неделю
+            if len(last_weights) > 1:
+                current_weight = last_weights[0].weight
+                week_ago_weight = last_weights[-1].weight
+                week_gain = current_weight - week_ago_weight
+                
+                # Прирост за последние сутки
+                day_gain = 0
+                yesterday = datetime.now() - timedelta(days=1)
+                for i in range(1, len(last_weights)):
+                    if last_weights[i].timestamp >= yesterday:
+                        day_gain = current_weight - last_weights[i].weight
+                        break
+                
+                weights_text += f"\n📈 *Изменения:*\n"
+                weights_text += f"• За последние сутки: {day_gain:+.2f} кг\n"
+                weights_text += f"• За неделю: {week_gain:+.2f} кг\n"
+            
+            await bot.send_message(
+                callback_query.from_user.id,
+                weights_text,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Генерируем AI сводку
+            await bot.send_message(
+                callback_query.from_user.id,
+                "🤖 Анализирую динамику веса..."
+            )
+            
+            weight_summary = ai_assistant.generate_weight_summary(db)
+            
+            # Создаем клавиатуру
+            keyboard = InlineKeyboardMarkup(row_width=2)
+            keyboard.add(
+                InlineKeyboardButton("➕ Добавить вес", callback_data='add_weight'),
+                InlineKeyboardButton("📊 График", callback_data='weight_chart'),
+                InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu')
+            )
+            
+            await bot.send_message(
+                callback_query.from_user.id,
+                f"📊 *AI Анализ веса:*\n\n{weight_summary}",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard
+            )
+        else:
+            # Если нет данных о весе
+            keyboard = InlineKeyboardMarkup(row_width=1)
+            keyboard.add(
+                InlineKeyboardButton("➕ Добавить первое измерение", callback_data='add_weight'),
+                InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu')
+            )
+            
+            await bot.send_message(
+                callback_query.from_user.id,
+                "У вас пока нет записей о весе ребенка.",
+                reply_markup=keyboard
+            )
+        
+        db.close()
+        return
+
+
 
     elif action == 'prescriptions':
         await bot.answer_callback_query(callback_query.id)
@@ -976,17 +1181,12 @@ async def handle_medication_dosage(message: types.Message, state: FSMContext):
 # Команда для AI консультации
 @dp.message_handler(commands=['ai'])
 async def ai_command(message: types.Message):
-    """Активация AI консультации"""
+    """Команда для запроса к AI ассистенту"""
     await message.reply(
-        "🤖 *AI Консультант активирован*\n\n"
-        "Задайте любой вопрос о здоровье ребенка, и я постараюсь помочь.\n"
-        "Например:\n"
-        "• _Что делать при температуре 38?_\n"
-        "• _Какой должен быть вес в 6 месяцев?_\n"
-        "• _Когда начинать прикорм?_\n\n"
-        "Для выхода используйте /menu\n"
-        "Для сброса истории диалога используйте /reset",
-        parse_mode=ParseMode.MARKDOWN
+        "🤖 Задайте ваш вопрос AI-ассистенту. Я помогу с вопросами о здоровье, развитии и уходе за ребенком.",
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu')
+        )
     )
 
 @dp.message_handler(commands=['reset'])
@@ -1002,14 +1202,14 @@ async def reset_ai_history(message: types.Message):
 # Обработчик callback для AI консультации
 @dp.callback_query_handler(lambda c: c.data == 'ai_consult')
 async def process_ai_consult(callback_query: types.CallbackQuery):
-    """Обработка выбора AI консультации из меню"""
+    """Обработка запроса на AI консультацию"""
     await bot.answer_callback_query(callback_query.id)
     await bot.send_message(
         callback_query.from_user.id,
-        "🤖 *AI Консультант активирован*\n\n"
-        "Задайте любой вопрос о здоровье ребенка.\n"
-        "Для выхода используйте /menu",
-        parse_mode=ParseMode.MARKDOWN
+        "🤖 Задайте ваш вопрос AI-ассистенту. Я помогу с вопросами о здоровье, развитии и уходе за ребенком.",
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu')
+        )
     )
 
 # Обработчик callback для статистики
@@ -1266,13 +1466,18 @@ async def process_message_text(text: str, message: types.Message, state: FSMCont
                 # Формируем сообщение о цвете
                 color_text = f"🎨 Цвет: {stool_data['color']}\n" if stool_data['color'] else ""
                 
+                # Добавляем кнопку возврата в меню
+                keyboard = InlineKeyboardMarkup()
+                keyboard.add(InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu'))
+                
                 # Отправляем сообщение об успешном добавлении
                 await message.reply(
                     f"✅ *Запись о стуле добавлена*\n\n"
                     f"📝 Описание: {stool_data['description']}\n"
                     f"{color_text}"
                     f"🕒 Время: {datetime.now().strftime('%H:%M')}\n",
-                    parse_mode=ParseMode.MARKDOWN
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=keyboard
                 )
                 return
             except Exception as e:
@@ -1311,67 +1516,270 @@ async def process_message_text(text: str, message: types.Message, state: FSMCont
         # Проверяем, является ли сообщение запросом на создание напоминания
         reminder_data = reminder_parser.parse_reminder(text)
         if reminder_data:
-            # Показываем сообщение о распознавании напоминания
-            await message.reply("🔄 Распознаю напоминание...")
-            
             try:
-                # Парсим дату и время
-                reminder_time_str = f"{reminder_data['date']} {reminder_data['time']}"
-                reminder_time = datetime.strptime(reminder_time_str, "%d.%m.%Y %H:%M")
+                created_reminders = []
                 
-                # Проверяем, что время в будущем
-                if reminder_time <= datetime.now():
-                    await message.reply("❌ Время напоминания должно быть в будущем.")
+                # Обрабатываем каждое напоминание
+                for reminder_info in reminder_data:
+                    # Парсим дату и время
+                    reminder_time_str = f"{reminder_info['date']} {reminder_info['time']}"
+                    reminder_time = datetime.strptime(reminder_time_str, "%d.%m.%Y %H:%M")
+                    
+                    # Для повторяющихся напоминаний корректируем время
+                    if reminder_info['repeat_type'] != 'once':
+                        # Если время уже прошло сегодня, устанавливаем на завтра
+                        if reminder_time <= datetime.now():
+                            reminder_time = reminder_time + timedelta(days=1)
+                    else:
+                        # Для однократных напоминаний проверяем, что время в будущем
+                        if reminder_time <= datetime.now():
+                            await message.reply(f"❌ Время напоминания '{reminder_info['description']}' должно быть в будущем.")
+                            continue
+                    
+                    # Создаем напоминание
+                    reminder = Reminder(
+                        child_id=child.id,
+                        description=reminder_info['description'],
+                        reminder_time=reminder_time,
+                        status='active',
+                        repeat_type=reminder_info['repeat_type'],
+                        repeat_interval=reminder_info['repeat_interval']
+                    )
+                    
+                    db.add(reminder)
+                    created_reminders.append((reminder, reminder_info))
+                
+                if created_reminders:
+                    db.commit()
+                    
+                    # Формируем сообщение об успехе
+                    success_messages = []
+                    for reminder, reminder_info in created_reminders:
+                        repeat_text = "однократное"
+                        if reminder_info['repeat_type'] == 'daily':
+                            repeat_text = f"каждые {reminder_info['repeat_interval']} день(дней)"
+                        elif reminder_info['repeat_type'] == 'weekly':
+                            repeat_text = f"каждые {reminder_info['repeat_interval']} неделю(недель)"
+                        elif reminder_info['repeat_type'] == 'monthly':
+                            repeat_text = f"каждые {reminder_info['repeat_interval']} месяц(ев)"
+                        elif reminder_info['repeat_type'] == 'hourly':
+                            repeat_text = f"каждые {reminder_info['repeat_interval']} час(ов)"
+                        
+                        success_messages.append(
+                            f"📝 {reminder_info['description']}\n"
+                            f"⏰ Время: {reminder.reminder_time.strftime('%d.%m.%Y, %H:%M')}\n"
+                            f"🔄 Повторение: {repeat_text}"
+                        )
+                    
+                    # Добавляем кнопку возврата в меню
+                    keyboard = InlineKeyboardMarkup()
+                    keyboard.add(InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu'))
+                    
+                    if len(created_reminders) == 1:
+                        await message.reply(
+                            f"✅ Напоминание создано!\n\n{success_messages[0]}",
+                            reply_markup=keyboard
+                        )
+                    else:
+                        await message.reply(
+                            f"✅ Создано напоминаний: {len(created_reminders)}\n\n" + "\n\n".join(success_messages),
+                            reply_markup=keyboard
+                        )
                     return
-                
-                # Создаем напоминание
-                reminder = Reminder(
-                    child_id=child.id,
-                    description=reminder_data['description'],
-                    reminder_time=reminder_time,
-                    status='active',
-                    repeat_type=reminder_data['repeat_type'],
-                    repeat_interval=reminder_data['repeat_interval']
-                )
-                
-                db.add(reminder)
-                db.commit()
-                
-                # Формируем сообщение об успехе
-                repeat_text = "однократное"
-                if reminder_data['repeat_type'] == 'daily':
-                    repeat_text = f"каждые {reminder_data['repeat_interval']} день(дней)"
-                elif reminder_data['repeat_type'] == 'weekly':
-                    repeat_text = f"каждые {reminder_data['repeat_interval']} неделю(недель)"
-                elif reminder_data['repeat_type'] == 'monthly':
-                    repeat_text = f"каждые {reminder_data['repeat_interval']} месяц(ев)"
-                
-                success_message = f"""✅ *Напоминание создано!*
-
-📝 Описание: {reminder_data['description']}
-⏰ Время: {reminder_time.strftime('%d.%m.%Y %H:%M')}
-🔄 Повторение: {repeat_text}
-"""
-                
-                # Создаем клавиатуру для действий
-                keyboard = InlineKeyboardMarkup()
-                keyboard.row(
-                    InlineKeyboardButton("📝 Все напоминания", callback_data='reminders_list'),
-                    InlineKeyboardButton("🔙 В меню", callback_data='reminders_menu')
-                )
-                
-                await message.reply(success_message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-                return
                 
             except Exception as e:
                 logger.error(f"Ошибка при создании напоминания: {e}")
                 await message.reply("❌ Произошла ошибка при создании напоминания.")
                 return
         
-        # Обычный запрос к AI ассистенту с полным контекстом из БД
-        typing_status = await bot.send_chat_action(message.chat.id, 'typing')
-        response = ai_assistant.get_response(text, db_session=db)
-        await message.reply(response)
+        # Если ничего не подошло, считаем сообщение запросом к AI ассистенту
+        with SessionLocal() as db:
+            try:
+                # Получаем ответ от AI ассистента
+                response = ai_assistant.get_response(text, db)
+                
+                # Добавляем кнопку возврата в меню
+                keyboard = InlineKeyboardMarkup()
+                keyboard.add(InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu'))
+                
+                await message.reply(response, reply_markup=keyboard)
+            except Exception as e:
+                logger.error(f"Ошибка при получении ответа от AI: {e}")
+                await message.reply("❌ Произошла ошибка при обработке вашего запроса.")
+        
+        # Проверяем, является ли сообщение записью о весе
+        weight_data = ai_assistant.parse_weight(text)
+        if weight_data:
+            try:
+                # Создаем запись о весе
+                weight = Weight(
+                    child_id=child.id,
+                    weight=weight_data['weight'],
+                    timestamp=datetime.now()
+                )
+                
+                db.add(weight)
+                db.commit()
+                
+                # Добавляем кнопку возврата в меню
+                keyboard = InlineKeyboardMarkup()
+                keyboard.add(InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu'))
+                
+                # Отправляем сообщение об успешном добавлении
+                await message.reply(
+                    f"✅ *Запись о весе добавлена*\n\n"
+                    f"⚖️ Вес: {weight_data['weight']} кг\n"
+                    f"📅 Дата: {datetime.now().strftime('%d.%m.%Y, %H:%M')}\n",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=keyboard
+                )
+                return
+            except Exception as e:
+                logger.error(f"Ошибка при добавлении записи о весе: {e}")
+        
+        # Проверяем, является ли сообщение записью о стуле
+        stool_data = ai_assistant.parse_stool(text)
+        if stool_data:
+            try:
+                # Создаем запись о стуле
+                stool = Stool(
+                    child_id=child.id,
+                    description=stool_data['description'],
+                    color=stool_data['color'],
+                    timestamp=datetime.now()
+                )
+                
+                db.add(stool)
+                db.commit()
+                
+                # Формируем сообщение о цвете
+                color_text = f"🎨 Цвет: {stool_data['color']}\n" if stool_data['color'] else ""
+                
+                # Добавляем кнопку возврата в меню
+                keyboard = InlineKeyboardMarkup()
+                keyboard.add(InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu'))
+                
+                # Отправляем сообщение об успешном добавлении
+                await message.reply(
+                    f"✅ *Запись о стуле добавлена*\n\n"
+                    f"📝 Описание: {stool_data['description']}\n"
+                    f"{color_text}"
+                    f"🕒 Время: {datetime.now().strftime('%H:%M')}\n",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=keyboard
+                )
+                return
+            except Exception as e:
+                logger.error(f"Ошибка при добавлении записи о стуле: {e}")
+        
+        # Проверяем, является ли сообщение записью о приеме лекарства
+        medication_data = ai_assistant.parse_medication(text)
+        if medication_data:
+            try:
+                # Создаем запись о лекарстве
+                medication = Medication(
+                    child_id=child.id,
+                    medication_name=medication_data['medication_name'],
+                    dosage=medication_data['dosage'] or "",
+                    timestamp=datetime.now()
+                )
+                
+                db.add(medication)
+                db.commit()
+                
+                # Формируем сообщение о дозировке
+                dosage_text = f"💊 Дозировка: {medication_data['dosage']}\n" if medication_data['dosage'] else ""
+                
+                # Отправляем сообщение об успешном добавлении
+                await message.reply(
+                    f"✅ *Запись о приеме лекарства добавлена*\n\n"
+                    f"💊 Лекарство: {medication_data['medication_name']}\n"
+                    f"{dosage_text}"
+                    f"🕒 Время: {datetime.now().strftime('%H:%M')}\n",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            except Exception as e:
+                logger.error(f"Ошибка при добавлении записи о лекарстве: {e}")
+        
+        # Проверяем, является ли сообщение запросом на создание напоминания
+        reminder_data = reminder_parser.parse_reminder(text)
+        if reminder_data:
+            try:
+                created_reminders = []
+                
+                # Обрабатываем каждое напоминание
+                for reminder_info in reminder_data:
+                    # Парсим дату и время
+                    reminder_time_str = f"{reminder_info['date']} {reminder_info['time']}"
+                    reminder_time = datetime.strptime(reminder_time_str, "%d.%m.%Y %H:%M")
+                    
+                    # Для повторяющихся напоминаний корректируем время
+                    if reminder_info['repeat_type'] != 'once':
+                        # Если время уже прошло сегодня, устанавливаем на завтра
+                        if reminder_time <= datetime.now():
+                            reminder_time = reminder_time + timedelta(days=1)
+                    else:
+                        # Для однократных напоминаний проверяем, что время в будущем
+                        if reminder_time <= datetime.now():
+                            await message.reply(f"❌ Время напоминания '{reminder_info['description']}' должно быть в будущем.")
+                            continue
+                    
+                    # Создаем напоминание
+                    reminder = Reminder(
+                        child_id=child.id,
+                        description=reminder_info['description'],
+                        reminder_time=reminder_time,
+                        status='active',
+                        repeat_type=reminder_info['repeat_type'],
+                        repeat_interval=reminder_info['repeat_interval']
+                    )
+                    
+                    db.add(reminder)
+                    created_reminders.append((reminder, reminder_info))
+                
+                if created_reminders:
+                    db.commit()
+                    
+                    # Формируем сообщение об успехе
+                    success_messages = []
+                    for reminder, reminder_info in created_reminders:
+                        repeat_text = "однократное"
+                        if reminder_info['repeat_type'] == 'daily':
+                            repeat_text = f"каждые {reminder_info['repeat_interval']} день(дней)"
+                        elif reminder_info['repeat_type'] == 'weekly':
+                            repeat_text = f"каждые {reminder_info['repeat_interval']} неделю(недель)"
+                        elif reminder_info['repeat_type'] == 'monthly':
+                            repeat_text = f"каждые {reminder_info['repeat_interval']} месяц(ев)"
+                        elif reminder_info['repeat_type'] == 'hourly':
+                            repeat_text = f"каждые {reminder_info['repeat_interval']} час(ов)"
+                        
+                        success_messages.append(
+                            f"📝 {reminder_info['description']}\n"
+                            f"⏰ Время: {reminder.reminder_time.strftime('%d.%m.%Y, %H:%M')}\n"
+                            f"🔄 Повторение: {repeat_text}"
+                        )
+                    
+                    # Добавляем кнопку возврата в меню
+                    keyboard = InlineKeyboardMarkup()
+                    keyboard.add(InlineKeyboardButton("🔙 Назад в меню", callback_data='back_to_menu'))
+                    
+                    if len(created_reminders) == 1:
+                        await message.reply(
+                            f"✅ Напоминание создано!\n\n{success_messages[0]}",
+                            reply_markup=keyboard
+                        )
+                    else:
+                        await message.reply(
+                            f"✅ Создано напоминаний: {len(created_reminders)}\n\n" + "\n\n".join(success_messages),
+                            reply_markup=keyboard
+                        )
+                    return
+                
+            except Exception as e:
+                logger.error(f"Ошибка при создании напоминания: {e}")
+                await message.reply("❌ Произошла ошибка при создании напоминания.")
+                return
     finally:
         db.close()
 
@@ -1379,83 +1787,58 @@ async def process_message_text(text: str, message: types.Message, state: FSMCont
 @dp.message_handler(content_types=types.ContentType.TEXT)
 async def handle_text_message(message: types.Message, state: FSMContext):
     """Обработка текстовых сообщений"""
+    # Сохраняем пользователя
+    db: Session = next(get_db())
+    try:
+        await save_user(message.from_user, db)
+    finally:
+        db.close()
+    
+    # Получаем текущее состояние
     current_state = await state.get_state()
-    if current_state is None:  # Нет активного состояния
-        await process_message_text(message.text, message, state)
+    
+    # Если есть активное состояние, не обрабатываем как обычное сообщение
+    if current_state:
+        return
+    
+    # Обрабатываем текст
+    await process_message_text(message.text, message, state)
 
 # Обработчик голосовых сообщений
 @dp.message_handler(content_types=types.ContentType.VOICE)
 async def handle_voice_message(message: types.Message, state: FSMContext):
-    """Обработка голосовых сообщений с преобразованием в текст"""
+    """Обработка голосовых сообщений"""
     current_state = await state.get_state()
-    if current_state is None:  # Нет активного состояния
-        # Отправляем сообщение о том, что обрабатываем голосовое
-        processing_msg = await message.reply("🎤 Обрабатываю голосовое сообщение...")
+    if current_state is not None:
+        return
+    
+    await message.reply("🔄 Обрабатываю ваше голосовое сообщение...")
+    
+    try:
+        # Скачиваем голосовое сообщение
+        file_info = await bot.get_file(message.voice.file_id)
+        voice_file = io.BytesIO()
+        await bot.download_file(file_info.file_path, voice_file)
         
-        try:
-            # Получаем файл голосового сообщения
-            voice_file = await bot.get_file(message.voice.file_id)
-            voice_path = voice_file.file_path
+        # Сохраняем во временный файл
+        with tempfile.NamedTemporaryFile(suffix=".ogg") as temp_voice:
+            temp_voice.write(voice_file.getvalue())
+            temp_voice.flush()
             
-            # Загружаем голосовой файл
-            voice_data = io.BytesIO()
-            await bot.download_file(voice_path, voice_data)
-            voice_data.seek(0)
+            # Преобразуем в текст с помощью OpenAI Whisper API
+            with open(temp_voice.name, "rb") as audio_file:
+                transcript = openai.Audio.transcribe("whisper-1", audio_file)
             
-            # Создаем временный файл для сохранения голосового сообщения
-            with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as temp_voice:
-                temp_voice.write(voice_data.read())
-                temp_voice_path = temp_voice.name
+            text = transcript.get("text", "")
             
-            try:
-                # Используем OpenAI Whisper API для преобразования голоса в текст
-                with open(temp_voice_path, "rb") as audio_file:
-                    transcript = openai.Audio.transcribe(
-                        model="whisper-1",
-                        file=audio_file
-                    )
-                
-                # Получаем текст из транскрипции
-                text = transcript.get('text', '')
-                
-                # Удаляем временный файл
-                os.unlink(temp_voice_path)
-                
-                # Если текст получен успешно
-                if text:
-                    # Показываем распознанный текст
-                    await bot.edit_message_text(
-                        f"🎤 → 📝: {text}", 
-                        chat_id=message.chat.id, 
-                        message_id=processing_msg.message_id
-                    )
-                    
-                    # Обрабатываем текст так же, как и обычное текстовое сообщение
-                    await process_message_text(text, message, state)
-                else:
-                    await bot.edit_message_text(
-                        "❌ Не удалось распознать текст в голосовом сообщении", 
-                        chat_id=message.chat.id, 
-                        message_id=processing_msg.message_id
-                    )
-            except Exception as e:
-                logger.error(f"Ошибка при распознавании голосового сообщения: {e}")
-                await bot.edit_message_text(
-                    "❌ Произошла ошибка при распознавании голосового сообщения", 
-                    chat_id=message.chat.id, 
-                    message_id=processing_msg.message_id
-                )
-                # Удаляем временный файл в случае ошибки
-                if os.path.exists(temp_voice_path):
-                    os.unlink(temp_voice_path)
-        
-        except Exception as e:
-            logger.error(f"Ошибка при обработке голосового сообщения: {e}")
-            await bot.edit_message_text(
-                "❌ Произошла ошибка при обработке голосового сообщения", 
-                chat_id=message.chat.id, 
-                message_id=processing_msg.message_id
-            )
+            if text:
+                await message.reply(f"🎤 Распознанный текст: {text}")
+                await process_message_text(text, message, state)
+            else:
+                await message.reply("❌ Не удалось распознать текст в голосовом сообщении.")
+    except Exception as e:
+        logger.error(f"Ошибка при обработке голосового сообщения: {e}")
+        await message.reply("❌ Произошла ошибка при обработке голосового сообщения.")
 
 # Обработчик для кнопки очистки данных ребенка
 @dp.callback_query_handler(lambda c: c.data == 'clear_child_data')
@@ -2907,6 +3290,104 @@ async def add_note_callback(callback_query: types.CallbackQuery):
         "Введите заголовок заметки:",
         reply_markup=keyboard
     )
+
+# Function to handle callback for add reminder
+@dp.callback_query_handler(lambda c: c.data == 'add_reminder')
+async def process_add_reminder(callback_query: types.CallbackQuery):
+    """Обработка добавления напоминания"""
+    await bot.answer_callback_query(callback_query.id)
+    
+    # Импортируем функцию для начала создания напоминания
+    from bot.reminders import create_reminder_start
+    await create_reminder_start(callback_query)
+
+# Обработчик для кнопки добавления кормления
+@dp.callback_query_handler(lambda c: c.data == 'add_feeding')
+async def process_add_feeding(callback_query: types.CallbackQuery):
+    """Обработка кнопки добавления кормления"""
+    await bot.answer_callback_query(callback_query.id)
+    await bot.send_message(
+        callback_query.from_user.id,
+        "Введите количество молока в миллилитрах (например: 80):"
+    )
+    await FeedingState.waiting_for_amount.set()
+
+# Обработчик для создания напоминаний из назначений с помощью AI
+@dp.callback_query_handler(lambda c: c.data == 'create_reminders_from_prescriptions')
+async def create_reminders_from_prescriptions(callback_query: types.CallbackQuery):
+    """Создание напоминаний на основе назначений с помощью AI"""
+    await bot.answer_callback_query(callback_query.id)
+    
+    db: Session = next(get_db())
+    try:
+        child = db.query(Child).first()
+        
+        # Получаем активные назначения
+        prescriptions = db.query(Prescription).filter(
+            Prescription.child_id == child.id,
+            Prescription.is_active == 1
+        ).all()
+        
+        if not prescriptions:
+            await bot.send_message(
+                callback_query.from_user.id,
+                "У вас нет активных назначений для создания напоминаний."
+            )
+            return
+        
+        # Отправляем сообщение о генерации
+        await bot.send_message(
+            callback_query.from_user.id,
+            "🤖 Анализирую назначения и создаю напоминания..."
+        )
+        
+        # Генерируем предложения по напоминаниям с помощью AI
+        reminders_suggestions = ai_assistant.generate_prescription_reminders(db)
+        
+        # Добавляем кнопки для управления
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        keyboard.add(
+            InlineKeyboardButton("✅ Создать все предложенные", callback_data='create_all_suggested_reminders'),
+            InlineKeyboardButton("🔙 Назад к назначениям", callback_data='prescriptions')
+        )
+        
+        await bot.send_message(
+            callback_query.from_user.id,
+            f"📋 *AI предлагает создать следующие напоминания:*\n\n{reminders_suggestions}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при создании напоминаний из назначений: {e}")
+        await bot.send_message(
+            callback_query.from_user.id,
+            "❌ Произошла ошибка при создании напоминаний."
+        )
+    finally:
+        db.close()
+
+# Обработчик для кнопки добавления записи о стуле
+@dp.callback_query_handler(lambda c: c.data == 'add_stool')
+async def process_add_stool(callback_query: types.CallbackQuery):
+    """Обработка кнопки добавления записи о стуле"""
+    await bot.answer_callback_query(callback_query.id)
+    await bot.send_message(
+        callback_query.from_user.id,
+        "💩 Опишите стул ребенка (цвет, консистенция):"
+    )
+    await StoolState.waiting_for_description.set()
+
+# Обработчик для кнопки добавления веса
+@dp.callback_query_handler(lambda c: c.data == 'add_weight')
+async def process_add_weight(callback_query: types.CallbackQuery):
+    """Обработка кнопки добавления веса"""
+    await bot.answer_callback_query(callback_query.id)
+    await bot.send_message(
+        callback_query.from_user.id,
+        "Введите текущий вес в килограммах (например: 8.5):"
+    )
+    await WeightState.waiting_for_weight.set()
 
 if __name__ == '__main__':
     logger.info("Запуск бота...")

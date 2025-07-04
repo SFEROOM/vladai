@@ -1,8 +1,9 @@
 import openai
 import logging
-from typing import Optional, Dict, List
-from datetime import datetime
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
 import json
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -13,20 +14,25 @@ class MedicalAIAssistant:
         self.api_key = api_key
         openai.api_key = api_key
         self.conversation_history = []
-        self.system_prompt = """Ты - опытный семейный медицинский ассистент с глубокими знаниями в педиатрии. 
-        Твоя задача - помогать родителям следить за здоровьем детей, анализировать данные и давать персонализированные рекомендации.
-        
-        Ты помнишь всю историю переписки и используешь эти данные для контекста.
-        
-        Ты можешь:
-        - Давать рекомендации по питанию и уходу за детьми на основе их возраста и особенностей
-        - Анализировать динамику веса, роста и других показателей
-        - Помогать интерпретировать симптомы (но всегда рекомендовать обращаться к врачу при серьезных симптомах)
-        - Напоминать о прививках и визитах к врачу согласно календарю
-        - Отвечать на вопросы о развитии ребенка с учетом его индивидуальных особенностей
-        - Анализировать режим кормления и давать рекомендации по его оптимизации
-        
-        Важно: Ты НЕ заменяешь врача. При серьезных симптомах всегда рекомендуй обратиться к специалисту."""
+        self.system_prompt = """Ты - опытный педиатр и семейный медицинский консультант, который помогает родителям отслеживать здоровье и развитие их ребенка.
+
+Твои основные задачи:
+1. Давать медицинские консультации на основе данных о ребенке
+2. Анализировать показатели развития (вес, питание, пищеварение)
+3. Напоминать о важных медицинских мероприятиях
+4. Помогать интерпретировать назначения врачей
+5. Отвечать на вопросы о здоровье и развитии ребенка
+
+Важные правила:
+- Всегда учитывай контекст и историю ребенка при ответах
+- Используй данные из базы (вес, кормления, стул, назначения, заметки)
+- Будь дружелюбным, но профессиональным
+- При серьезных симптомах всегда рекомендуй обратиться к врачу
+- Помни все предыдущие диалоги и используй их для персонализации ответов
+- Обращайся к ребенку по имени, если оно известно
+- Учитывай возраст ребенка при даче рекомендаций
+
+Отвечай на русском языке, кратко и по существу."""
         
         # Кэш данных для быстрого доступа
         self.data_cache = {
@@ -242,8 +248,28 @@ class MedicalAIAssistant:
                     chat_history = db_session.query(ChatHistory).filter_by(child_id=child.id).order_by(ChatHistory.timestamp.desc()).limit(10).all()
                     if chat_history:
                         context += "Последние диалоги с ассистентом:\n"
-                        for chat in chat_history:
+                        for chat in reversed(chat_history):  # Показываем в хронологическом порядке
                             context += f"- Вопрос: {chat.user_message}\n  Ответ: {chat.assistant_response}\n\n"
+                    
+                    # Получаем активные напоминания
+                    from database.models import Reminder
+                    active_reminders = db_session.query(Reminder).filter(
+                        Reminder.child_id == child.id,
+                        Reminder.status == 'active'
+                    ).order_by(Reminder.reminder_time).all()
+                    
+                    if active_reminders:
+                        context += "Активные напоминания:\n"
+                        for reminder in active_reminders[:5]:  # Показываем первые 5
+                            repeat_text = "однократно"
+                            if reminder.repeat_type == 'daily':
+                                repeat_text = "ежедневно"
+                            elif reminder.repeat_type == 'weekly':
+                                repeat_text = "еженедельно"
+                            elif reminder.repeat_type == 'monthly':
+                                repeat_text = "ежемесячно"
+                            context += f"- {reminder.description} в {reminder.reminder_time.strftime('%H:%M')} ({repeat_text})\n"
+                        context += "\n"
             
             # Создаем сообщения для API
             messages = [
@@ -570,6 +596,318 @@ class MedicalAIAssistant:
             logger.error(f"Ошибка при генерации сводки о развитии: {e}")
             return "Не удалось сгенерировать сводку о развитии ребенка из-за ошибки."
     
+    def generate_feeding_summary(self, db_session) -> str:
+        """
+        Генерирует сводку по кормлениям ребенка
+        
+        Args:
+            db_session: Сессия базы данных
+            
+        Returns:
+            Текстовая сводка по кормлениям
+        """
+        try:
+            from database.models import Child, Feeding
+            
+            child = db_session.query(Child).first()
+            if not child:
+                return "Нет данных о ребенке."
+            
+            # Получаем данные о кормлениях за последнюю неделю
+            week_ago = datetime.now() - timedelta(days=7)
+            feedings = db_session.query(Feeding).filter(
+                Feeding.child_id == child.id,
+                Feeding.timestamp >= week_ago
+            ).order_by(Feeding.timestamp.desc()).all()
+            
+            if not feedings:
+                return "За последнюю неделю нет данных о кормлениях."
+            
+            # Подготавливаем данные для анализа
+            total_amount = sum(f.amount for f in feedings)
+            avg_amount = total_amount / len(feedings)
+            
+            # Группируем по дням
+            feedings_by_day = {}
+            for feeding in feedings:
+                day = feeding.timestamp.date()
+                if day not in feedings_by_day:
+                    feedings_by_day[day] = []
+                feedings_by_day[day].append(feeding)
+            
+            # Анализируем типы питания
+            food_types = {}
+            for feeding in feedings:
+                if feeding.food_type not in food_types:
+                    food_types[feeding.food_type] = 0
+                food_types[feeding.food_type] += feeding.amount
+            
+            # Формируем контекст для AI
+            context = f"""
+            Ребенок: {child.name}, возраст: {(datetime.now().date() - child.birth_date).days // 30} месяцев
+            
+            Данные о кормлениях за последнюю неделю:
+            - Всего кормлений: {len(feedings)}
+            - Общий объем: {total_amount} мл
+            - Средний объем за кормление: {avg_amount:.0f} мл
+            - Среднее количество кормлений в день: {len(feedings) / len(feedings_by_day):.1f}
+            
+            Типы питания:
+            """
+            
+            for food_type, amount in food_types.items():
+                percentage = (amount / total_amount) * 100
+                context += f"- {food_type}: {amount} мл ({percentage:.0f}%)\n"
+            
+            # Генерируем сводку с помощью AI
+            messages = [
+                {"role": "system", "content": "Ты - опытный педиатр. Проанализируй данные о кормлениях ребенка и дай краткую сводку с рекомендациями."},
+                {"role": "user", "content": f"Проанализируй данные о кормлениях:\n{context}\n\nДай краткую сводку (3-4 предложения) о режиме питания ребенка."}
+            ]
+            
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=300
+            )
+            
+            return response['choices'][0]['message']['content']
+            
+        except Exception as e:
+            logger.error(f"Ошибка при генерации сводки по кормлениям: {e}")
+            return "Не удалось сгенерировать сводку по кормлениям."
+    
+    def generate_weight_summary(self, db_session) -> str:
+        """
+        Генерирует сводку о весе ребенка
+        
+        Args:
+            db_session: Сессия базы данных
+            
+        Returns:
+            Текстовая сводка о весе
+        """
+        try:
+            from database.models import Child, Weight
+            
+            child = db_session.query(Child).first()
+            if not child:
+                return "Нет данных о ребенке."
+            
+            # Получаем последние данные о весе
+            weights = db_session.query(Weight).filter_by(child_id=child.id).order_by(Weight.timestamp.desc()).all()
+            if not weights:
+                return "Нет данных о весе ребенка."
+            
+            first_weight = weights[0].weight
+            last_weight = weights[-1].weight
+            weight_change = last_weight - first_weight
+            
+            # Определяем тенденцию изменения веса
+            trend = "стабильный"
+            if weight_change > 0.1:
+                trend = "увеличение"
+            elif weight_change < -0.1:
+                trend = "уменьшение"
+            
+            # Формируем контекст для AI
+            context = f"""
+            Ребенок: {child.name}, возраст: {(datetime.now().date() - child.birth_date).days // 30} месяцев
+            
+            Данные о весе:
+            - Начальный вес: {first_weight} кг
+            - Текущий вес: {last_weight} кг
+            - Изменение веса: {weight_change:.2f} кг ({trend})
+            """
+            
+            # Генерируем сводку с помощью AI
+            messages = [
+                {"role": "system", "content": "Ты - опытный педиатр. Проанализируй данные о весе ребенка и дай краткую сводку."},
+                {"role": "user", "content": f"Проанализируй данные о весе:\n{context}\n\nДай краткую сводку (3-4 предложения) о динамике веса ребенка."}
+            ]
+            
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=300
+            )
+            
+            return response['choices'][0]['message']['content']
+            
+        except Exception as e:
+            logger.error(f"Ошибка при генерации сводки о весе: {e}")
+            return "Не удалось сгенерировать сводку о весе."
+    
+    def generate_stool_summary(self, db_session) -> str:
+        """
+        Генерирует сводку о пищеварении ребенка
+        
+        Args:
+            db_session: Сессия базы данных
+            
+        Returns:
+            Текстовая сводка о пищеварении
+        """
+        try:
+            from database.models import Child, Stool
+            
+            child = db_session.query(Child).first()
+            if not child:
+                return "Нет данных о ребенке."
+            
+            # Получаем данные о стуле за последнюю неделю
+            week_ago = datetime.now() - timedelta(days=7)
+            stools = db_session.query(Stool).filter(
+                Stool.child_id == child.id,
+                Stool.timestamp >= week_ago
+            ).order_by(Stool.timestamp.desc()).all()
+            
+            if not stools:
+                return "За последнюю неделю нет данных о стуле."
+            
+            # Анализируем данные
+            total_stools = len(stools)
+            
+            # Группируем по дням
+            stools_by_day = {}
+            for stool in stools:
+                day = stool.timestamp.date()
+                if day not in stools_by_day:
+                    stools_by_day[day] = []
+                stools_by_day[day].append(stool)
+            
+            avg_per_day = total_stools / len(stools_by_day)
+            
+            # Анализируем цвета и консистенцию
+            colors = {}
+            consistencies = {}
+            
+            for stool in stools:
+                if stool.color:
+                    colors[stool.color] = colors.get(stool.color, 0) + 1
+                
+                # Анализируем описание для определения консистенции
+                desc_lower = stool.description.lower()
+                if 'жидк' in desc_lower:
+                    consistencies['жидкий'] = consistencies.get('жидкий', 0) + 1
+                elif 'тверд' in desc_lower:
+                    consistencies['твердый'] = consistencies.get('твердый', 0) + 1
+                elif 'кашеобразн' in desc_lower:
+                    consistencies['кашеобразный'] = consistencies.get('кашеобразный', 0) + 1
+                else:
+                    consistencies['нормальный'] = consistencies.get('нормальный', 0) + 1
+            
+            # Формируем контекст для AI
+            context = f"""
+            Ребенок: {child.name}, возраст: {(datetime.now().date() - child.birth_date).days // 30} месяцев
+            
+            Данные о стуле за последнюю неделю:
+            - Всего записей: {total_stools}
+            - В среднем в день: {avg_per_day:.1f} раз
+            
+            Цвета стула:
+            """
+            
+            for color, count in colors.items():
+                percentage = (count / total_stools) * 100
+                context += f"- {color}: {count} раз ({percentage:.0f}%)\n"
+            
+            context += "\nКонсистенция:"
+            for consistency, count in consistencies.items():
+                percentage = (count / total_stools) * 100
+                context += f"\n- {consistency}: {count} раз ({percentage:.0f}%)"
+            
+            # Генерируем сводку с помощью AI
+            messages = [
+                {"role": "system", "content": "Ты - опытный педиатр. Проанализируй данные о стуле ребенка и дай краткую оценку состояния пищеварения."},
+                {"role": "user", "content": f"Проанализируй данные о стуле:\n{context}\n\nДай краткую сводку (3-4 предложения) о состоянии пищеварения ребенка."}
+            ]
+            
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=300
+            )
+            
+            return response['choices'][0]['message']['content']
+            
+        except Exception as e:
+            logger.error(f"Ошибка при генерации сводки о пищеварении: {e}")
+            return "Не удалось сгенерировать сводку о пищеварении."
+    
+    def generate_prescription_reminders(self, db_session) -> str:
+        """
+        Генерирует предложения по напоминаниям на основе назначений врача
+        
+        Args:
+            db_session: Сессия базы данных
+            
+        Returns:
+            Текст с предложениями по напоминаниям
+        """
+        try:
+            from database.models import Child, Prescription
+            
+            child = db_session.query(Child).first()
+            if not child:
+                return "Нет данных о ребенке."
+            
+            # Получаем активные назначения
+            prescriptions = db_session.query(Prescription).filter(
+                Prescription.child_id == child.id,
+                Prescription.is_active == 1
+            ).all()
+            
+            if not prescriptions:
+                return "Нет активных назначений для создания напоминаний."
+            
+            # Формируем контекст для AI
+            context = f"Ребенок: {child.name}, возраст: {(datetime.now().date() - child.birth_date).days // 30} месяцев\n\n"
+            context += "Активные назначения врачей:\n"
+            
+            for p in prescriptions:
+                if p.full_text:
+                    context += f"- {p.medication_name}: {p.full_text}\n"
+                else:
+                    context += f"- {p.medication_name}: {p.dosage}, {p.frequency}\n"
+                
+                if p.doctor_name:
+                    context += f"  Врач: {p.doctor_name}\n"
+                if p.notes:
+                    context += f"  Примечания: {p.notes}\n"
+                context += "\n"
+            
+            # Генерируем предложения с помощью AI
+            messages = [
+                {"role": "system", "content": "Ты - опытный педиатр. Проанализируй назначения врача и предложи оптимальные напоминания для приема лекарств."},
+                {"role": "user", "content": f"""На основе следующих назначений создай список напоминаний:
+
+{context}
+
+Для каждого лекарства предложи:
+1. Время приема (утро/день/вечер с конкретным временем)
+2. Описание (что и в какой дозировке принимать)
+3. Частоту (ежедневно/через день и т.д.)
+
+Учитывай возраст ребенка и совместимость лекарств. Если лекарства нужно принимать с интервалом, укажи это."""}
+            ]
+            
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=messages,
+                temperature=0.7,
+                max_tokens=500
+            )
+            
+            return response['choices'][0]['message']['content']
+            
+        except Exception as e:
+            logger.error(f"Ошибка при генерации напоминаний из назначений: {e}")
+            return "Не удалось сгенерировать напоминания из назначений."
+    
     def clear_history(self):
         """Очистить историю разговора"""
         self.conversation_history = []
@@ -628,6 +966,70 @@ class MedicalAIAssistant:
             logger.error(f"Ошибка при распознавании кормления: {e}")
             return None
     
+    def parse_weight(self, text: str) -> dict:
+        """
+        Распознает запись о весе из текста пользователя
+        
+        Args:
+            text: Текст сообщения
+            
+        Returns:
+            Словарь с данными о весе или None, если не распознано
+        """
+        try:
+            # Ключевые слова для веса
+            keywords = ['вес', 'весит', 'взвесили', 'взвешивание', 'кг', 'килограмм']
+            
+            # Проверяем наличие ключевых слов
+            has_keyword = False
+            for keyword in keywords:
+                if keyword in text.lower():
+                    has_keyword = True
+                    break
+            
+            if not has_keyword:
+                return None
+            
+            prompt = f"""Распознай запись о весе ребенка из текста пользователя и верни результат в формате JSON.
+            
+            Текст пользователя: "{text}"
+            
+            Формат ответа должен быть JSON со следующими полями:
+            - weight: вес в килограммах (число)
+            - is_weight: true если это запись о весе, false если нет
+            
+            Примеры:
+            1. "Вес 8.5 кг" -> {{"weight": 8.5, "is_weight": true}}
+            2. "Взвесили ребенка - 9 кг" -> {{"weight": 9, "is_weight": true}}
+            3. "Сегодня весит 7.8" -> {{"weight": 7.8, "is_weight": true}}
+            
+            Верни только JSON без дополнительного текста.
+            """
+            
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "Ты - помощник для распознавания записей о весе."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=300,
+                temperature=0.3
+            )
+            
+            assistant_response = response['choices'][0]['message']['content']
+            weight_data = self._parse_json_response(assistant_response)
+            
+            if weight_data and weight_data.get('is_weight', False):
+                return {
+                    'weight': weight_data.get('weight')
+                }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка при распознавании веса: {e}")
+            return None
+    
     def parse_stool(self, text: str) -> dict:
         """
         Распознает запись о стуле из текста пользователя
@@ -638,20 +1040,33 @@ class MedicalAIAssistant:
         Returns:
             Словарь с данными о стуле или None, если не распознано
         """
+        # Пропускаем, если текст содержит слова, связанные с напоминаниями
+        reminder_keywords = ['напомни', 'напоминай', 'напоминание', 'каждый день', 'через', 'минут', 'час']
+        text_lower = text.lower()
+        for keyword in reminder_keywords:
+            if keyword in text_lower:
+                return None
+                
         try:
             prompt = f"""Распознай запись о стуле ребенка из текста пользователя и верни результат в формате JSON.
             
             Текст пользователя: "{text}"
             
+            ВАЖНО: Это должна быть именно запись о стуле ребенка, а не использование слова в переносном смысле или в контексте напоминаний.
+            
             Формат ответа должен быть JSON со следующими полями:
             - description: описание стула
             - color: цвет стула (если указан)
-            - is_stool: true если это запись о стуле, false если нет
+            - is_stool: true если это запись о стуле ребенка, false если нет
             
-            Примеры:
+            Примеры записей о стуле:
             1. "Был стул, желтый, кашеобразный" -> {{"description": "кашеобразный", "color": "желтый", "is_stool": true}}
             2. "Покакал жидким стулом" -> {{"description": "жидкий", "color": null, "is_stool": true}}
             3. "Был зеленый стул" -> {{"description": "стул", "color": "зеленый", "is_stool": true}}
+            
+            Примеры НЕ записей о стуле:
+            1. "напомни есть гавно каждый день" -> {{"description": "", "color": null, "is_stool": false}}
+            2. "создай напоминание про гавно" -> {{"description": "", "color": null, "is_stool": false}}
             
             Верни только JSON без дополнительного текста.
             """
@@ -659,7 +1074,7 @@ class MedicalAIAssistant:
             response = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
                 messages=[
-                    {"role": "system", "content": "Ты - помощник для распознавания записей о стуле."},
+                    {"role": "system", "content": "Ты - помощник для распознавания записей о стуле ребенка. Отличай реальные записи о стуле от использования слов в переносном смысле."},
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=300,
@@ -798,3 +1213,16 @@ class MedicalAIAssistant:
         except Exception as e:
             logger.error(f"Ошибка при распознавании запроса на создание напоминаний: {e}")
             return False 
+    
+    def _extract_json(self, text: str) -> Optional[Dict]:
+        """Извлекает JSON из текста"""
+        try:
+            # Ищем JSON в тексте
+            json_match = re.search(r'\{.*\}', text, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                return json.loads(json_str)
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка при извлечении JSON: {e}")
+            return None 
