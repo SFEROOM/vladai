@@ -1,111 +1,122 @@
-# Деплой ботов на Ubuntu сервер
+# Инструкция по деплою ботов на Ubuntu сервер
 
-## Подготовка к деплою
+## Требования
+- Ubuntu 20.04 или выше
+- Доступ к серверу по SSH с правами sudo
+- Открытый доступ к интернету для установки пакетов
 
-1. Создайте репозиторий на GitHub и загрузите туда код бота Влада:
+## Быстрая установка двух ботов (Влад и Санек)
 
+1. Подключитесь к серверу по SSH:
 ```bash
-cd /Users/vladislavankovskij/Desktop/Влад
-git init
-git add .
-git commit -m "Первоначальная загрузка кода бота"
-git remote add origin https://github.com/SFEROOM/vladai.git
-git push -u origin main
+ssh user@your-server-ip
 ```
 
-2. Убедитесь, что в файле `config.py` используются правильные токены и настройки для продакшена.
-
-## Варианты деплоя
-
-### Вариант 1: Деплой обоих ботов сразу
-
-1. Подключитесь к вашему Ubuntu серверу по SSH:
-
+2. Скачайте и запустите скрипт установки:
 ```bash
-ssh username@your_server_ip
+# Скачиваем скрипт
+wget https://raw.githubusercontent.com/SFEROOM/vladai/main/deploy/setup_two_bots.sh
+
+# Делаем скрипт исполняемым
+chmod +x setup_two_bots.sh
+
+# Запускаем установку
+sudo ./setup_two_bots.sh
 ```
 
-2. Скопируйте скрипт настройки на сервер:
-
+3. После установки проверьте статус ботов:
 ```bash
-scp /Users/vladislavankovskij/Desktop/Влад/deploy/setup_two_bots.sh username@your_server_ip:/tmp/
+# Статус бота Влада
+sudo systemctl status vlad-bot
+
+# Статус бота Санька
+sudo systemctl status sanek-bot
 ```
 
-3. Запустите скрипт настройки:
+## Управление ботами
 
+### Остановка ботов:
 ```bash
-ssh username@your_server_ip "sudo bash /tmp/setup_two_bots.sh"
+sudo systemctl stop vlad-bot
+sudo systemctl stop sanek-bot
 ```
 
-4. Проверьте статус ботов:
-
+### Запуск ботов:
 ```bash
-ssh username@your_server_ip "sudo systemctl status vlad-bot"
-ssh username@your_server_ip "sudo systemctl status sanek-bot"
+sudo systemctl start vlad-bot
+sudo systemctl start sanek-bot
 ```
 
-### Вариант 2: Деплой только бота Влада
-
-1. Подключитесь к вашему Ubuntu серверу по SSH:
-
+### Перезапуск ботов:
 ```bash
-ssh username@your_server_ip
+sudo systemctl restart vlad-bot
+sudo systemctl restart sanek-bot
 ```
 
-2. Скопируйте скрипт настройки на сервер:
-
+### Просмотр логов:
 ```bash
-scp /Users/vladislavankovskij/Desktop/Влад/deploy/setup_server.sh username@your_server_ip:/tmp/
-```
+# Логи бота Влада
+sudo journalctl -u vlad-bot -f
 
-3. Запустите скрипт настройки:
-
-```bash
-ssh username@your_server_ip "sudo bash /tmp/setup_server.sh"
-```
-
-4. Проверьте статус бота:
-
-```bash
-ssh username@your_server_ip "sudo systemctl status vlad-bot"
+# Логи бота Санька
+sudo journalctl -u sanek-bot -f
 ```
 
 ## Обновление ботов
 
-### Обновление бота Влада
-
+Для обновления используйте скрипт:
 ```bash
-ssh username@your_server_ip "sudo bash /home/username/bots/vlad_bot/deploy/update_bot.sh"
+cd /home/bots/vlad
+sudo ./deploy/update_bot.sh
+
+cd /home/bots/sanek
+sudo ./deploy/update_bot.sh
 ```
 
-### Обновление бота Санька
+## Структура на сервере
 
-```bash
-ssh username@your_server_ip "cd /home/username/bots/sanek_bot && sudo git pull && sudo systemctl restart sanek-bot"
+```
+/home/bots/
+├── vlad/          # Бот для Влада
+│   ├── venv/      # Виртуальное окружение
+│   ├── main.py    # Главный файл
+│   ├── config.py  # Конфигурация
+│   └── family_assistant.db  # База данных
+│
+└── sanek/         # Бот для Санька
+    ├── venv/      # Виртуальное окружение
+    ├── main.py    # Главный файл
+    ├── config.py  # Конфигурация
+    └── sanek_assistant.db  # База данных
 ```
 
-## Просмотр логов
+## Важные замечания
 
+1. **Токены ботов**: Убедитесь, что используете правильные токены для каждого бота
+2. **База данных**: Каждый бот использует свою базу данных
+3. **Миграции**: При первом запуске автоматически применяются все миграции
+4. **Автозапуск**: Боты настроены на автоматический запуск при перезагрузке сервера
+
+## Решение проблем
+
+### Бот не запускается
+1. Проверьте логи: `sudo journalctl -u vlad-bot -n 50`
+2. Проверьте токен бота в config.py
+3. Убедитесь, что порт не занят другим процессом
+
+### Ошибки с базой данных
+1. Удалите базу данных и перезапустите бота:
 ```bash
-# Логи бота Влада
-ssh username@your_server_ip "sudo journalctl -u vlad-bot -f"
-
-# Логи бота Санька
-ssh username@your_server_ip "sudo journalctl -u sanek-bot -f"
+sudo rm /home/bots/vlad/family_assistant.db
+sudo systemctl restart vlad-bot
 ```
 
-## Управление сервисами
-
+### Проблемы с зависимостями
+1. Активируйте виртуальное окружение и переустановите зависимости:
 ```bash
-# Остановка ботов
-ssh username@your_server_ip "sudo systemctl stop vlad-bot"
-ssh username@your_server_ip "sudo systemctl stop sanek-bot"
-
-# Запуск ботов
-ssh username@your_server_ip "sudo systemctl start vlad-bot"
-ssh username@your_server_ip "sudo systemctl start sanek-bot"
-
-# Перезапуск ботов
-ssh username@your_server_ip "sudo systemctl restart vlad-bot"
-ssh username@your_server_ip "sudo systemctl restart sanek-bot"
+cd /home/bots/vlad
+source venv/bin/activate
+pip install -r requirements.txt --upgrade
+deactivate
+sudo systemctl restart vlad-bot
 ``` 

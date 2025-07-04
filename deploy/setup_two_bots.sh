@@ -27,6 +27,39 @@ echo "Клонирование репозитория Влада..."
 cd /home/bots/vlad
 git clone https://github.com/SFEROOM/vladai.git .
 
+# Настройка конфигурации для бота Влада
+echo "Настройка конфигурации для бота Влада..."
+cat > /home/bots/vlad/config.py << 'EOF'
+import os
+
+# Конфигурация для ребенка Влад
+CHILD_NAME = "Влад"
+
+# Telegram Bot Configuration
+TELEGRAM_BOT_TOKEN = "8003507941:AAGzJz7QJQqrKKYdWPOLKPzx7xJsEfwvVJg"
+
+# OpenAI API Configuration  
+OPENAI_API_KEY = "sk-proj-nJsAOvb9QJxcxB8DJKqLT3BlbkFJcRu8LGIlTvT5aqGHPGqO"
+
+# Database Configuration - уникальная база для каждого ребенка
+DATABASE_URL = f'sqlite:///family_assistant.db'
+
+# Logging Configuration
+LOG_LEVEL = 'INFO'
+
+# Bot Configuration
+BOT_ADMIN_IDS = []  # Добавьте ID администраторов при необходимости
+
+# Application Configuration
+APP_NAME = f"Медицинский ассистент - {CHILD_NAME}"
+APP_VERSION = "1.0.0"
+
+# Google Sheets API
+GOOGLE_SHEETS_CREDENTIALS = 'credentials.json'
+GOOGLE_SHEETS_SPREADSHEET_ID = None  # Установите ID таблицы при необходимости
+GOOGLE_SHEETS_ENABLED = False
+EOF
+
 # Создание виртуального окружения
 echo "Настройка виртуального окружения для бота Влада..."
 python3 -m venv venv
@@ -59,9 +92,10 @@ EOF
 #############################
 echo "===== НАСТРОЙКА БОТА САНЬКА ====="
 
-# Копирование кода для бота Санька
-echo "Копирование кода для бота Санька..."
-cp -r /home/bots/vlad/* /home/bots/sanek/
+# Клонирование кода для бота Санька
+echo "Клонирование кода для бота Санька..."
+cd /home/bots/sanek
+git clone https://github.com/SFEROOM/vladai.git .
 
 # Изменение конфигурации для бота Санька
 echo "Настройка конфигурации для бота Санька..."
